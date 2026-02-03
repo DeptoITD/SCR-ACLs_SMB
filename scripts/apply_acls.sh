@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Config base
-INI_FILE="${INI_FILE:-${REPO_DIR}/config/acl_matrix.ini}"
+INI_FILE="${INI_FILE:-${REPO_DIR}/config/rules.d/acls.ini}"
 LOG_DIR="${REPO_DIR}/logs"
 LOG_FILE="${LOG_DIR}/apply_acls.log"
 mkdir -p "${LOG_DIR}"
@@ -40,6 +40,7 @@ resolve_acl_subject() {
   local kind="u"
   local name="$raw"
 
+  # Si viene prefijado (u:IND_A o g:IND_A), se respeta
   if [[ "$raw" =~ ^[ug]: ]]; then
     kind="${raw%%:*}"
     name="${raw#*:}"
@@ -47,11 +48,13 @@ resolve_acl_subject() {
     return 0
   fi
 
+  # Si existe como grupo, preferimos grupo (suele ser lo correcto para perfiles)
   if getent group "$raw" >/dev/null 2>&1; then
     kind="g"
   elif getent passwd "$raw" >/dev/null 2>&1; then
     kind="u"
   else
+    # fallback: usuario (para no bloquear; Samba/LDAP podrían resolver)
     kind="u"
   fi
 
@@ -117,6 +120,10 @@ parse_ini() {
 
     # SPECIALTIES: una por línea
     if [[ "$section" == "SPECIALTIES" ]]; then
+      # evita meter basura si alguien deja algo tipo "A_ARQ ; comentario"
+      line="${line%%;*}"
+      line="$(trim "$line")"
+      [[ -z "$line" ]] && continue
       SPECIALTIES+=("$line")
       continue
     fi
@@ -150,7 +157,6 @@ split_csv() {
   local -n out="$2"
   out=()
   IFS=',' read -r -a out <<< "$csv"
-  # trim de cada item
   for i in "${!out[@]}"; do
     out[$i]="$(trim "${out[$i]}")"
   done
@@ -169,12 +175,17 @@ WIP_FOLDER="${GLOBAL[wip_folder]:-01_WIP}"
 [[ -d "${ROOT}" ]] || die "ROOT no existe o no es directorio: ${ROOT}"
 [[ "${#SPECIALTIES[@]}" -gt 0 ]] || die "No hay SPECIALTIES en el INI"
 
-# Detectar perfiles: toda key en PROFILE_* (base_project o write o wip_full_control)
+# Detectar perfiles: incluye cualquier sección que haya tocado alguna llave soportada
 declare -a PROFILES
-for p in "${!PROFILE_base_project[@]}" "${!PROFILE_wip_full_control[@]}" "${!PROFILE_write[@]}"; do
+for p in \
+  "${!PROFILE_base_project[@]}" \
+  "${!PROFILE_base_wip[@]}" \
+  "${!PROFILE_wip_full_control[@]}" \
+  "${!PROFILE_write[@]}" \
+  "${!PROFILE_read[@]}"
+do
   PROFILES+=("$p")
 done
-# uniq
 mapfile -t PROFILES < <(printf "%s\n" "${PROFILES[@]}" | awk '!seen[$0]++' | sort)
 
 [[ "${#PROFILES[@]}" -gt 0 ]] || die "No hay perfiles en el INI (secciones tipo [IND_*])"
@@ -203,8 +214,10 @@ for profile in "${PROFILES[@]}"; do
 
   log_info "Perfil=${profile} subject=${subject} base_project=${local_base_project} base_wip=${local_base_wip} wip_full=${local_wip_full:-N/A} read=${local_read:-N/A} write=${local_write:-N/A}"
 
-  # Construir sets de especialidades write/read
+  # Construir set de especialidades con WRITE (RESET por perfil, para evitar contaminación)
+  unset is_write || true
   declare -A is_write
+
   if [[ -n "$local_write" ]]; then
     declare -a write_list
     split_csv "$local_write" write_list
@@ -216,7 +229,6 @@ for profile in "${PROFILES[@]}"; do
   # Recorre proyectos
   for proj_path in "${PROJECT_PATHS[@]}"; do
     [[ -d "$proj_path" ]] || continue
-    proj_name="$(basename "$proj_path")"
 
     # base_project sobre el proyecto (no recursivo)
     apply_acl_one "$subject" "$local_base_project" "$proj_path" "false"
