@@ -1,0 +1,16 @@
+# Logs locales
+logs/
+*.log
+
+# Backups ACL (NO versionar)
+backups/
+*.facl
+
+# Temporales
+*.tmp
+*.swp
+*~
+
+# IDEs
+.vscode/
+.idea/
