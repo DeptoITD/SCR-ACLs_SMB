@@ -26,34 +26,18 @@ No crea carpetas ni usuarios. Solo actúa sobre recursos existentes.
 
 ```text
 ├── config/
-│   ├── projects.conf          # Lista declarativa de proyectos válidos
-│   ├── users.conf             # Usuarios y grupos a los que se aplican ACL
+│   ├── projects.conf          # Lista declarativa de proyectos
+│   ├── users.conf             # Usuarios y grupos existentes
 │   └── rules.d/
-│       └── *.rules            # Reglas declarativas de permisos (input principal)
+│       └── *.rules            # Reglas declarativas de permisos
 ├── scripts/
 │   ├── apply_acls.sh          # Motor de aplicación de ACLs
-│   ├── validate.sh            # Validaciones previas (usuarios, rutas, base)
-│   └── backup_restore_acl.sh  # Backup y restauración completa de ACLs
+│   ├── validate.sh            # Validaciones previas 
+│   └── backup_restore_acl.sh  # Backup y restauración completa
 ├── logs/
 │   └── apply_acls.log         # Registro de ejecuciones y resultados
-└── README.md                  # Documentación del sistema
+└── README.md                  # Documentación
 ```
-
-### Descripción general
-
-- **config/**  
-  Contiene toda la configuración declarativa. Ningún permiso se define en los scripts.
-
-- **rules.d/*.rules**  
-  Fuente de verdad del sistema. Cada línea representa una regla ACL auditable.
-
-- **scripts/**  
-  Implementan validación, simulación, aplicación real y rollback.
-
-- **logs/**  
-  Garantizan trazabilidad completa.
-
-
 
 ## 4. Flujo de ejecución
 

@@ -23,9 +23,6 @@ Cada script cumple una función específica:
 - validate.sh: validación ligera.
 - backup_restore_acl.sh: seguridad operativa.
 
-## Decisión 5: Backup como estándar
-
-El backup previo se definió como paso obligatorio antes de cualquier ejecución real.
 
 ## Estado actual
 
