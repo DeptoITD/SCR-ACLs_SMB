@@ -53,18 +53,3 @@ Se implementa una validación dura que impide ejecutar el script fuera de:
 `/srv/samba/02_Proyectos`.
 
 ---
-
-## Estado actual
-
-- Sistema funcional.
-- ACLs verificadas en DRY-RUN.
-- Scripts listos para producción.
-- Documentación alineada con la implementación real.
-
----
-
-## Próximos pasos
-
-- Automatizar generación de reglas desde matrices.
-- Integrar en pipelines controlados.
-- Generar reportes de ejecución.
