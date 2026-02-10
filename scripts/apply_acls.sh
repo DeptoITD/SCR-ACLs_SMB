@@ -355,3 +355,5 @@ done
 
 log_ok "📊 Resumen: APPLIED=${APPLIED} SKIPPED_NO_WIP=${SKIPPED_NO_WIP} SKIPPED_NO_SPECIALTY_PATH=${SKIPPED_NO_SP}"
 log_info "🏁 apply_acls finalizado"
+
+
