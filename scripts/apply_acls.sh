@@ -3,42 +3,33 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# -------------------------
 # Config base
+# -------------------------
 INI_FILE="${INI_FILE:-${REPO_DIR}/config/rules.d/acls.ini}"
 LOG_DIR="${REPO_DIR}/logs"
 LOG_FILE="${LOG_DIR}/apply_acls.log"
 mkdir -p "${LOG_DIR}"
 
 DRY_RUN="${DRY_RUN:-0}"
+CONSOLE_MODE="${CONSOLE_MODE:-compact}"     # compact | verbose
 DEFAULT_ON_NONRECURSIVE_DIRS="${DEFAULT_ON_NONRECURSIVE_DIRS:-1}"
-CONSOLE_MODE="${CONSOLE_MODE:-compact}"  # compact | verbose
+
+# Si quieres velocidad en árboles enormes, pon SIMPLE_RECURSIVE=1 para usar setfacl -R
+# (por defecto hacemos find para separar dir/file y no meter 'x' en archivos)
+SIMPLE_RECURSIVE="${SIMPLE_RECURSIVE:-0}"
 
 # -------------------------
-# Logging (SIN pipes/tee)
+# Logging (sin pipes/tee)
 # -------------------------
 ts() { date -Is; }
 
 _log_line() {
-  # $1=LEVEL, $2=MSG
-  local level="$1"
-  local msg="$2"
+  local level="$1"; shift
+  local msg="$*"
   local line="[$level] $(ts) $msg"
-
-  # siempre al archivo
   printf "%s\n" "$line" >> "${LOG_FILE}"
-
-  # a consola (según modo)
-  case "${CONSOLE_MODE}" in
-    verbose)
-      printf "%s\n" "$line"
-      ;;
-    compact)
-      printf "%s\n" "$line"
-      ;;
-    *)
-      printf "%s\n" "$line"
-      ;;
-  esac
+  printf "%s\n" "$line"
 }
 
 log_info() { _log_line "INFO"  "ℹ️  $*"; }
@@ -48,7 +39,6 @@ log_ok()   { _log_line "OK"    "✅ $*"; }
 
 die() { log_err "$*"; exit 1; }
 
-# Trap para saber EXACTAMENTE dónde revienta
 trap 'rc=$?; log_err "💥 Abortado (exit=$rc) en línea ${LINENO}: ${BASH_COMMAND}"; exit $rc' ERR
 
 # -------------------------
@@ -63,23 +53,17 @@ trim() {
 
 run_cmd() {
   log_info "🧾 [CMD] $*"
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    return 0
-  fi
+  [[ "${DRY_RUN}" == "1" ]] && return 0
   "$@"
 }
 
-# --- u: vs g: ---
 resolve_acl_subject() {
   local raw="$1"
   local kind="u"
-  local name="$raw"
 
   # Si viene prefijado (u:IND_A o g:IND_A), se respeta
   if [[ "$raw" =~ ^[ug]: ]]; then
-    kind="${raw%%:*}"
-    name="${raw#*:}"
-    printf "%s:%s" "$kind" "$name"
+    printf "%s" "$raw"
     return 0
   fi
 
@@ -89,8 +73,7 @@ resolve_acl_subject() {
   elif getent passwd "$raw" >/dev/null 2>&1; then
     kind="u"
   else
-    # fallback: usuario
-    kind="u"
+    kind="u"  # fallback (Samba/LDAP/AD podrían resolverlo)
   fi
 
   printf "%s:%s" "$kind" "$raw"
@@ -105,23 +88,56 @@ warn_if_unknown_subject() {
   fi
 }
 
-apply_acl_one() {
-  local subject="$1"    # u:NAME o g:NAME
-  local perms="$2"      # rwx, r-x, --x, ---, etc.
-  local abs_path="$3"
-  local recursive="$4"  # true/false
+apply_acl_nonrec() {
+  local subject="$1" perms="$2" path="$3"
+  local kind="${subject%%:*}" name="${subject#*:}"
 
-  local kind="${subject%%:*}"
-  local name="${subject#*:}"
+  run_cmd setfacl -m "${kind}:${name}:${perms}" "${path}"
+  if [[ -d "${path}" && "${DEFAULT_ON_NONRECURSIVE_DIRS}" == "1" ]]; then
+    run_cmd setfacl -d -m "${kind}:${name}:${perms}" "${path}"
+  fi
+}
 
-  if [[ "${recursive}" == "true" ]]; then
-    run_cmd setfacl -R -m "${kind}:${name}:${perms}" "${abs_path}"
-    run_cmd setfacl -R -d -m "${kind}:${name}:${perms}" "${abs_path}"
+# Aplica ACL recursivo separando dirs y files (mejor control)
+apply_acl_tree_split() {
+  local subject="$1" dir_perms="$2" file_perms="$3" def_dir="$4" def_file="$5" path="$6"
+  local kind="${subject%%:*}" name="${subject#*:}"
+
+  # directorios
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log_info "🧾 [CMD] find '${path}' -type d -exec setfacl -m ${kind}:${name}:${dir_perms} {} +"
+    log_info "🧾 [CMD] find '${path}' -type d -exec setfacl -d -m ${kind}:${name}:${def_dir} {} +"
+    log_info "🧾 [CMD] find '${path}' -type f -exec setfacl -m ${kind}:${name}:${file_perms} {} +"
+    log_info "🧾 [CMD] find '${path}' -type f -exec setfacl -d -m ${kind}:${name}:${def_file} {} +"
+    return 0
+  fi
+
+  # -xdev evita cruzar otros mounts; -P evita seguir symlinks
+  find -P "${path}" -xdev -type d -exec setfacl -m "${kind}:${name}:${dir_perms}" {} +
+  find -P "${path}" -xdev -type d -exec setfacl -d -m "${kind}:${name}:${def_dir}" {} +
+
+  find -P "${path}" -xdev -type f -exec setfacl -m "${kind}:${name}:${file_perms}" {} +
+  find -P "${path}" -xdev -type f -exec setfacl -d -m "${kind}:${name}:${def_file}" {} +
+}
+
+# Recursivo simple (rápido, menos fino)
+apply_acl_tree_simple() {
+  local subject="$1" perms="$2" path="$3"
+  local kind="${subject%%:*}" name="${subject#*:}"
+
+  run_cmd setfacl -R -m "${kind}:${name}:${perms}" "${path}"
+  run_cmd setfacl -R -d -m "${kind}:${name}:${perms}" "${path}"
+}
+
+# Deny explícito recursivo (para invisibilidad)
+apply_deny_tree() {
+  local subject="$1" path="$2"
+
+  if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then
+    apply_acl_tree_simple "${subject}" "---" "${path}"
   else
-    run_cmd setfacl -m "${kind}:${name}:${perms}" "${abs_path}"
-    if [[ -d "${abs_path}" && "${DEFAULT_ON_NONRECURSIVE_DIRS}" == "1" ]]; then
-      run_cmd setfacl -d -m "${kind}:${name}:${perms}" "${abs_path}"
-    fi
+    # deny tanto en dirs como files, defaults también (por consistencia)
+    apply_acl_tree_split "${subject}" "---" "---" "---" "---" "${path}"
   fi
 }
 
@@ -130,11 +146,11 @@ apply_acl_one() {
 # -------------------------
 declare -A GLOBAL
 declare -a SPECIALTIES
+
 declare -A PROFILE_base_project
 declare -A PROFILE_base_wip
 declare -A PROFILE_wip_full_control
 declare -A PROFILE_write
-declare -A PROFILE_read
 
 parse_ini() {
   [[ -f "${INI_FILE}" ]] || die "INI no existe: ${INI_FILE}"
@@ -171,11 +187,10 @@ parse_ini() {
         GLOBAL["$key"]="$val"
       else
         case "$key" in
-          base_project) PROFILE_base_project["$section"]="$val" ;;
-          base_wip) PROFILE_base_wip["$section"]="$val" ;;
+          base_project)     PROFILE_base_project["$section"]="$val" ;;
+          base_wip)         PROFILE_base_wip["$section"]="$val" ;;
           wip_full_control) PROFILE_wip_full_control["$section"]="$val" ;;
-          write) PROFILE_write["$section"]="$val" ;;
-          read) PROFILE_read["$section"]="$val" ;;
+          write)            PROFILE_write["$section"]="$val" ;;
           *) : ;;
         esac
       fi
@@ -196,11 +211,11 @@ split_csv() {
 # -------------------------
 # MAIN
 # -------------------------
-log_info "🚀 Iniciando apply_acls (DRY_RUN=${DRY_RUN}) INI=${INI_FILE} CONSOLE_MODE=${CONSOLE_MODE}"
+log_info "🚀 Iniciando apply_acls (DRY_RUN=${DRY_RUN}) INI=${INI_FILE} CONSOLE_MODE=${CONSOLE_MODE} SIMPLE_RECURSIVE=${SIMPLE_RECURSIVE}"
 
-# Validaciones básicas
 command -v setfacl >/dev/null 2>&1 || die "setfacl no está instalado o no está en PATH"
 command -v getent  >/dev/null 2>&1 || die "getent no está disponible (paquete libc-bin / glibc tools)"
+command -v find    >/dev/null 2>&1 || die "find no está disponible"
 
 parse_ini
 
@@ -208,25 +223,38 @@ ROOT="${GLOBAL[root]:-}"
 PROJECT_GLOB="${GLOBAL[project_glob]:-*}"
 WIP_FOLDER="${GLOBAL[wip_folder]:-01_WIP}"
 
+BASE_PROJECT_DEFAULT="${GLOBAL[base_project]:-rx}"
+BASE_WIP_DEFAULT="${GLOBAL[base_wip]:-x}"
+
+WRITE_DIR="${GLOBAL[write_dir]:-rwx}"
+WRITE_FILE="${GLOBAL[write_file]:-rw-}"
+DEF_DIR="${GLOBAL[default_dir]:-${WRITE_DIR}}"
+DEF_FILE="${GLOBAL[default_file]:-${WRITE_FILE}}"
+
+HIDE_NON_WRITE="${GLOBAL[hide_non_write]:-1}"
+
 [[ -n "${ROOT}" ]] || die "GLOBAL.root no definido en INI"
 [[ -d "${ROOT}" ]] || die "ROOT no existe o no es directorio: ${ROOT}"
 [[ "${#SPECIALTIES[@]}" -gt 0 ]] || die "No hay SPECIALTIES en el INI"
 
-# Detectar perfiles
+# Safety rail (hard)
+EXPECTED_ROOT="/srv/samba/02_Proyectos"
+[[ "${ROOT}" == "${EXPECTED_ROOT}" ]] || die "ROOT='${ROOT}' no coincide con EXPECTED_ROOT='${EXPECTED_ROOT}'. Abortando."
+
+# Perfiles (secciones encontradas)
 declare -a PROFILES
 for p in \
   "${!PROFILE_base_project[@]}" \
   "${!PROFILE_base_wip[@]}" \
   "${!PROFILE_wip_full_control[@]}" \
-  "${!PROFILE_write[@]}" \
-  "${!PROFILE_read[@]}"
+  "${!PROFILE_write[@]}"
 do
   PROFILES+=("$p")
 done
 mapfile -t PROFILES < <(printf "%s\n" "${PROFILES[@]}" | awk '!seen[$0]++' | sort)
 [[ "${#PROFILES[@]}" -gt 0 ]] || die "No hay perfiles en el INI (secciones tipo [IND_*])"
 
-# Expandir proyectos existentes
+# Proyectos existentes
 shopt -s nullglob
 # shellcheck disable=SC2206
 PROJECT_PATHS=( ${ROOT}/${PROJECT_GLOB} )
@@ -236,28 +264,27 @@ shopt -u nullglob
 log_info "📁 Proyectos encontrados: ${#PROJECT_PATHS[@]}"
 log_info "👥 Perfiles encontrados: ${#PROFILES[@]}"
 
-# Contadores para resumen
 APPLIED=0
 SKIPPED_NO_WIP=0
 SKIPPED_NO_SP=0
 
 for profile in "${PROFILES[@]}"; do
-  local_base_project="${PROFILE_base_project[$profile]:-${GLOBAL[base_project]:-rx}}"
-  local_base_wip="${PROFILE_base_wip[$profile]:-${GLOBAL[base_wip]:-x}}"
-  local_wip_full="${PROFILE_wip_full_control[$profile]:-}"
-  local_write="${PROFILE_write[$profile]:-}"
-  local_read="${PROFILE_read[$profile]:-}"
+  base_project="${PROFILE_base_project[$profile]:-${BASE_PROJECT_DEFAULT}}"
+  base_wip="${PROFILE_base_wip[$profile]:-${BASE_WIP_DEFAULT}}"
+  wip_full="${PROFILE_wip_full_control[$profile]:-}"
+  write_csv="${PROFILE_write[$profile]:-}"
 
   subject="$(resolve_acl_subject "$profile")"
   warn_if_unknown_subject "$profile" "$subject"
 
-  log_info "🧩 Perfil=${profile} subject=${subject} base_project=${local_base_project} base_wip=${local_base_wip} wip_full=${local_wip_full:-N/A}"
+  log_info "🧩 Perfil=${profile} subject=${subject} base_project=${base_project} base_wip=${base_wip} wip_full=${wip_full:-N/A}"
 
-  unset is_write || true
+  # build write set
+  unset is_write 2>/dev/null || true
   declare -A is_write
-  if [[ -n "$local_write" ]]; then
+  if [[ -n "${write_csv}" ]]; then
     declare -a write_list
-    split_csv "$local_write" write_list
+    split_csv "${write_csv}" write_list
     for sp in "${write_list[@]}"; do
       [[ -n "$sp" ]] && is_write["$sp"]=1
     done
@@ -266,50 +293,58 @@ for profile in "${PROFILES[@]}"; do
   for proj_path in "${PROJECT_PATHS[@]}"; do
     [[ -d "$proj_path" ]] || continue
     proj_name="$(basename "$proj_path")"
+    wip_path="${proj_path}/${WIP_FOLDER}"
 
     log_info "📌 Proyecto=${proj_name} (base + WIP)"
 
-    # base_project (puede ver el proyecto)
-    apply_acl_one "$subject" "$local_base_project" "$proj_path" "false"
+    # base_project
+    apply_acl_nonrec "$subject" "$base_project" "$proj_path"
     ((++APPLIED))
-    log_ok "📍 base_project: ${profile} ${local_base_project} ${proj_path}"
+    log_ok "📍 base_project: ${profile} ${base_project} ${proj_path}"
 
-    wip_path="${proj_path}/${WIP_FOLDER}"
+    # WIP existe?
     if [[ ! -d "$wip_path" ]]; then
       ((++SKIPPED_NO_WIP))
       log_warn "📁 WIP no existe (se omite): ${wip_path}"
       continue
     fi
 
-    # base_wip: solo atravesar, NO listar (x / --x)
-    apply_acl_one "$subject" "$local_base_wip" "$wip_path" "false"
+    # base_wip (solo x para restringidos; BIM rx)
+    apply_acl_nonrec "$subject" "$base_wip" "$wip_path"
     ((++APPLIED))
-    log_ok "🧷 base_wip: ${profile} ${local_base_wip} ${wip_path}"
+    log_ok "🧷 base_wip: ${profile} ${base_wip} ${wip_path}"
 
-    # BIM: acceso total al WIP (todas las carpetas)
-    if [[ -n "$local_wip_full" ]]; then
-      apply_acl_one "$subject" "$local_wip_full" "$wip_path" "true"
+    # BIM: control total recursivo
+    if [[ -n "$wip_full" ]]; then
+      if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then
+        apply_acl_tree_simple "$subject" "$wip_full" "$wip_path"
+      else
+        # full control: dirs rwx, files rw-, defaults rwx/rw-
+        apply_acl_tree_split "$subject" "rwx" "rw-" "rwx" "rw-" "$wip_path"
+      fi
       ((++APPLIED))
-      log_ok "🔓 wip_full_control: ${profile} ${local_wip_full} ${wip_path} (recursivo)"
+      log_ok "🔓 wip_full_control: ${profile} ${wip_full} ${wip_path} (recursivo)"
       continue
     fi
 
+    # Perfiles restringidos: aplicar write y deny-by-default por especialidad
     for sp in "${SPECIALTIES[@]}"; do
       sp_path="${wip_path}/${sp}"
-      if [[ ! -e "$sp_path" ]]; then
-        ((++SKIPPED_NO_SP))
-        continue
-      fi
+      [[ -e "$sp_path" ]] || { ((++SKIPPED_NO_SP)); continue; }
 
       if [[ "${is_write[$sp]+x}" ]]; then
-        # Lo que edita: lectura + escritura + entrar
-        apply_acl_one "$subject" "rwx" "$sp_path" "true"
+        # WRITE: permisos finos
+        if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then
+          apply_acl_tree_simple "$subject" "rwx" "$sp_path"
+        else
+          apply_acl_tree_split "$subject" "${WRITE_DIR}" "${WRITE_FILE}" "${DEF_DIR}" "${DEF_FILE}" "$sp_path"
+        fi
         ((++APPLIED))
-        log_ok "✍️ WRITE: ${profile} rwx ${sp_path}"
+        log_ok "✍️ WRITE: ${profile} ${WRITE_DIR}/${WRITE_FILE} ${sp_path}"
       else
-        # Lo que NO edita: NO lo ve, NO lo lista
-        if [[ "$local_read" == "ALL_EXCEPT_WRITE" ]]; then
-          apply_acl_one "$subject" "---" "$sp_path" "true"
+        # HIDDEN: siempre que hide_non_write=1
+        if [[ "${HIDE_NON_WRITE}" == "1" ]]; then
+          apply_deny_tree "$subject" "$sp_path"
           ((++APPLIED))
           log_ok "🙈 HIDDEN: ${profile} --- ${sp_path}"
         fi
