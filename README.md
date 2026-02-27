@@ -23,10 +23,6 @@ El sistema está diseñado para ejecutarse de forma segura incluso cuando:
 
 El sistema se basa en un **modelo declarativo deny-by-default**, donde los permisos se definen en archivos de configuración versionados y se aplican mediante un motor controlado.
 
-### Principio de seguridad
-
-> **“Lo que no edita, NO lo ve (ni le aparece en Samba)”**
-
 Implementación (modelo **DENY-BY-DEFAULT**):
 
 - En cada proyecto, todos los perfiles pueden **ver y entrar** a `01_WIP` (`base_wip=rx`), para estandarizar navegación.
