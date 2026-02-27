@@ -2,65 +2,82 @@
 
 ## 1. Propósito
 
-Este repositorio implementa un sistema declarativo, idempotente y auditable para la gestión de permisos ACL POSIX sobre un entorno de proyectos alojados en un servidor Linux (Ubuntu) con almacenamiento compartido vía Samba.
+Este repositorio implementa un **sistema declarativo, idempotente y auditable** para la gestión de permisos **ACL POSIX** sobre proyectos alojados en un servidor **Linux (Ubuntu)** con almacenamiento compartido vía **Samba**.
 
-El objetivo principal es estandarizar y automatizar la asignación de permisos por perfil (disciplinas) y proyecto, evitando configuraciones manuales repetitivas, inconsistencias entre servidores y errores humanos en producción.
+El propósito del sistema es **estandarizar y automatizar** la asignación de permisos por **perfil** y **proyecto**, eliminando la gestión manual basada en comandos `setfacl`, la cual generaba:
 
-El sistema está diseñado para operar correctamente incluso cuando:
-- Algunos proyectos no existen en el servidor actual.
-- Algunas especialidades no están presentes aún o existen en otras máquinas.
-- Los usuarios o grupos provienen de Samba, AD o LDAP.
+- alto riesgo de error humano,
+- inconsistencias entre proyectos y servidores,
+- baja trazabilidad,
+- dificultad para auditoría y reversión de cambios.
 
-## 2. Alcance funcional
+El sistema está diseñado para ejecutarse de forma segura incluso cuando:
+- existen proyectos sin estructura completa,
+- algunas especialidades no están creadas aún,
+- los usuarios o grupos provienen de **Samba, Active Directory o LDAP**,
+- el script se ejecuta múltiples veces sin efectos acumulativos.
 
-El sistema permite:
-- Aplicar permisos ACL POSIX (setfacl) de forma declarativa.
-- Ejecutar múltiples veces sin efectos acumulativos (idempotencia).
-- Simular cambios mediante modo DRY-RUN antes de aplicar en producción.
-- Respaldar y restaurar ACLs completas del árbol de proyectos.
-- Registrar todas las acciones en logs estructurados.
+---
 
-No crea carpetas ni usuarios. Solo actúa sobre recursos existentes.
+## 2. Descripción técnica
 
-## 3. Estructura del repositorio
+El sistema se basa en un **modelo declarativo deny-by-default**, donde los permisos se definen en archivos de configuración versionados y se aplican mediante un motor controlado.
 
-```text
-├── config/
-│   ├── projects.conf          # Lista declarativa de proyectos
-│   ├── users.conf             # Usuarios y grupos existentes
-│   └── rules.d/
-│       └── *.rules            # Reglas declarativas de permisos
-├── scripts/
-│   ├── apply_acls.sh          # Motor de aplicación de ACLs
-│   ├── validate.sh            # Validaciones previas 
-│   └── backup_restore_acl.sh  # Backup y restauración completa
-├── logs/
-│   └── apply_acls.log         # Registro de ejecuciones y resultados
-└── README.md                  # Documentación
+Implementación (modelo **DENY-BY-DEFAULT**):
+
+- En cada proyecto, todos los perfiles pueden **ver y entrar** a `01_WIP` (`base_wip=rx`), para estandarizar navegación.
+- Dentro de `01_WIP`, cada perfil solo tiene permisos **de escritura** (`write`) en las especialidades declaradas.
+- Las especialidades no autorizadas reciben ACL explícita `---` para eliminar permisos residuales y evitar “apariciones”.
+- Para que las carpetas no autorizadas realmente **no aparezcan en el explorador de Windows**, el share de Samba debe tener `hide unreadable = yes`.
+- El perfil BIM es la única excepción con control total sobre todo el WIP (`wip_full_control`).
+
+
+### Alcance técnico
+
+El sistema **solo puede operar** sobre el siguiente árbol de directorios:
+
+```
+/srv/samba/02_Proyectos
 ```
 
-## 4. Flujo de ejecución
+Existe una validación dura que aborta la ejecución si el `root` configurado no coincide exactamente con esta ruta.
+Principio de seguridad
 
-Entrada:
-- Archivos de configuración declarativa.
-- Estado actual del filesystem.
+> **"Lo que no edita, NO lo ve (ni lo lista, ni le aparece)"**
 
-Proceso:
-1. Validación básica del entorno.
-2. Lectura de reglas.
-3. Resolución de rutas.
-4. Verificación de existencia.
-5. Aplicación de ACLs.
-6. Registro en logs.
+Modelo **DENY-BY-DEFAULT**:
 
-Salida:
-- ACLs aplicadas.
-- Logs detallados.
+- Solo se otorgan permisos explícitos en carpetas declaradas como `write`.
+- En `01_WIP`, los perfiles restringidos reciben **solo `x` (traverse)**.
+- Las carpetas no editables reciben ACL explícita `---`.
+- BIM es la única excepción con visibilidad total del WIP.
+---
+
+## Perfiles y permisos
+
+| Perfil | Carpetas con visualización y edición |
+|------|--------------------------------------|
+| IND_A | A_ARQ, O_LEV, YAC_ACU, YPA_PAT, YPM_PTR, YSE_SEN, YSH_SGH |
+| IND_E | E_EST, O_LEV |
+| IND_YTP | YTP_TOP, A_ARQ, O_LEV, YAC_ACU, YPA_PAT, YPM_PTR, YSE_SEN, YSH_SGH, E_EST |
+| IND_B | TODAS las carpetas del WIP |
 
 
-## 5. Uso (flujo operativo controlado)
+## Reglas operativas
 
-### 5.1 Validar entorno (OBLIGATORIO)
+- Git **NUNCA** con `sudo`.
+- Scripts ACL **SIEMPRE** con `sudo`.
+- No modificar ACLs manualmente fuera del sistema.
+- Flujo obligatorio: **backup → DRY-RUN → apply**.
+
+---
+
+## 3. Instrucciones de uso
+
+### Backup (obligatorio)
+
+Antes de cualquier ejecución se debe realizar un respaldo completo de ACLs:
+
 
 ```bash
 sudo ./scripts/backup_restore_acl.sh backup \
@@ -68,45 +85,57 @@ sudo ./scripts/backup_restore_acl.sh backup \
   /root/acl_before_$(date +%Y%m%d_%H%M).facl
 ```
 
-### 5.2 Backup previo (OBLIGATORIO)
-
-```bash
-sudo ./scripts/backup_restore_acl.sh backup \
-  /srv/samba/02_Proyectos \
-  /root/acl_before_$(date +%Y%m%d_%H%M).facl
-```
-
-### 5.3 Simulación (DRY-RUN)
-
+### DRY-RUN (prueba)
+Permite validar el impacto sin modificar permisos reales:
 ```bash
 sudo DRY_RUN=1 ./scripts/apply_acls.sh
 ```
+Durante el DRY-RUN se muestran los comandos setfacl que serían ejecutados, pero no se aplican cambios.
 
-### 5.4 Ejecución real
 
+### Ejecución real
+Una vez validado el DRY-RUN:
 ```bash
 sudo ./scripts/apply_acls.sh
 ```
 
-### 5.5 Rollback (En caso de falla restauración)
+---
+
+## Rollback
 
 ```bash
-sudo ./scripts/backup_restore_acl.sh restore \
-  / \
-  /root/acl_before_YYYYMMDD_HHMM.facl
+sudo ./scripts/backup_restore_acl.sh restore / /root/acl_before_YYYYMMDD_HHMM.facl
 ```
+--------
 
-### Reglas operativas
+## 4. Diagrama de secuencia (Entrada y salida)
 
-- Nunca ejecutar sin backup.
-- Siempre ejecutar DRY-RUN antes.
-- No aplicar ACLs manualmente fuera del sistema.
-
-## 6. Requisitos técnicos
-
-- Ubuntu Linux
-- Filesystem con soporte ACL (ext4)
-- Paquete acl instalado
-- Ejecución con privilegios sudo
+![Diagrama de secuencia del sistema de gestión de ACLs](docs/seq.png)
 
 
+--------------
+## 5. Estructura del repositorio
+
+```
+SCR-ACLs_SMB/
+├── backups
+│   ├── acl_before_20260203_182348.facl
+│   ├── acl_before_20260203_182510.facl
+│   ├── acl_before_20260203_190718.facl
+│   └── acl_before_20260203_192226.facl
+├── BITACORA.md
+├── config
+│   └── acls.ini
+├── docs
+│   └── seq.png
+├── legacy
+│   └── Asignar_permisos.sh
+├── logs
+│   ├── apply_acls.log
+│   └── backup_restore_acl.log
+├── README.md
+└── scripts
+    ├── apply_acls.sh
+    ├── backup_restore_acl.sh
+    └── validate.sh
+```

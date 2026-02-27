@@ -1,210 +1,393 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# scripts/apply_acls.sh
-#
-# Aplica ACLs desde reglas declarativas ubicadas en: config/rules.d/*.rules
-#
-# Formato por línea (separador ';'):
-#   <usuario>;<permisos>;<ruta_relativa>;<recursivo>
-#
-# Ejemplos:
-#   IND_A;rx;1288_UDQ;false
-#   IND_A;rx;1288_UDQ/01_WIP;false
-#   IND_A;rwx;1288_UDQ/01_WIP/A_ARQ;true
-#
-# Ideas clave del flujo:
-#  1) Cargar config (BASE, usuarios, etc.)
-#  2) Validar configuración (validate.sh)
-#  3) Leer cada archivo *.rules
-#  4) Por cada regla:
-#      - validar campos
-#      - construir ruta absoluta BASE + rel_path
-#      - si NO existe -> omitir (esto soporta especialidades "futuras" u "otras máquinas")
-#      - aplicar setfacl (normal o recursivo + default)
-#  5) Log detallado y consistente.
-#
-# Notas de diseño:
-# - Idempotente: puedes correrlo muchas veces sin que “acumule basura”
-# - No crea carpetas: si no existe, no inventa nada
-# - Default ACL solo cuando corresponde (en recursivo, o explícitamente si existe)
-
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# shellcheck source=/dev/null
-source "${REPO_DIR}/config/projects.conf"
-# shellcheck source=/dev/null
-source "${REPO_DIR}/config/users.conf"
+# -------------------------
+# Config base
+# -------------------------
+INI_FILE="${INI_FILE:-${REPO_DIR}/config/acls.ini}"
 
-RULES_DIR="${REPO_DIR}/config/rules.d"
 LOG_DIR="${REPO_DIR}/logs"
 LOG_FILE="${LOG_DIR}/apply_acls.log"
 mkdir -p "${LOG_DIR}"
 
-# Ejecutar de verdad (producción)
- DRY_RUN="${DRY_RUN:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+DEFAULT_ON_NONRECURSIVE_DIRS="${DEFAULT_ON_NONRECURSIVE_DIRS:-1}"
+
+# Si quieres velocidad en árboles enormes, pon SIMPLE_RECURSIVE=1 para usar setfacl -R
+SIMPLE_RECURSIVE="${SIMPLE_RECURSIVE:-0}"
 
 # -------------------------
-# Helpers de logging
+# Logging
 # -------------------------
 ts() { date -Is; }
 
-log_info() { echo "[INFO] $(ts) $*" | tee -a "${LOG_FILE}"; }
-log_warn() { echo "[WARN] $(ts) $*" | tee -a "${LOG_FILE}"; }
-log_err()  { echo "[ERROR] $(ts) $*" | tee -a "${LOG_FILE}"; }
-log_ok()   { echo "[OK] $(ts) $*" | tee -a "${LOG_FILE}"; }
+_log_line() {
+  local level="$1"; shift
+  local msg="$*"
+  local line="[$level] $(ts) $msg"
+  printf "%s\n" "$line" >> "${LOG_FILE}"
+  printf "%s\n" "$line"
+}
+
+log_info() { _log_line "INFO"  "ℹ️  $*"; }
+log_warn() { _log_line "WARN"  "⚠️  $*"; }
+log_err()  { _log_line "ERROR" "❌ $*"; }
+log_ok()   { _log_line "OK"    "✅ $*"; }
 
 die() { log_err "$*"; exit 1; }
 
-run_cmd() {
-  # Ejecuta comando o lo imprime si DRY_RUN=1
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    log_info "[DRY-RUN] $*"
-  else
-    "$@"
-  fi
-}
+trap 'rc=$?; log_err "💥 Abortado (exit=$rc) en línea ${LINENO}: ${BASH_COMMAND}"; exit $rc' ERR
 
 # -------------------------
-# Validaciones pequeñas pero útiles
+# Helpers
 # -------------------------
-is_bool() {
-  [[ "$1" == "true" || "$1" == "false" ]]
-}
-
-is_perms() {
-  # aceptamos combinaciones típicas: r, w, x, -, y en estilo setfacl (rx, rwx, r-x, etc.)
-  [[ "$1" =~ ^[r-][w-][x-]$ || "$1" =~ ^(r|w|x|rw|rx|wx|rwx|r-x|rw-|r--|---|rx-|r-x)$ ]]
-}
-
 trim() {
-  # trim espacios al inicio/fin
   local s="$1"
+  s="${s//$'\r'/}"                # mata CRLF de Windows
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   printf "%s" "$s"
 }
 
-# -------------------------
-# Aplicación de ACL
-# -------------------------
-apply_acl() {
-  local user="$1"
-  local perms="$2"
-  local abs_path="$3"
-  local recursive="$4"
+run_cmd() {
+  log_info "🧾 [CMD] $*"
+  [[ "${DRY_RUN}" == "1" ]] && return 0
+  "$@"
+}
 
-  # Si el usuario no está en tu catálogo, esto es un error de reglas/config, no del FS.
-  # Si prefieres "warn y seguir", cámbialo.
-  if ! getent passwd "${user}" >/dev/null 2>&1 && ! getent group "${user}" >/dev/null 2>&1; then
-    log_warn "Usuario/Grupo '${user}' no existe en el sistema (getent). Regla se aplica igual si Samba lo resuelve, pero ojo."
+# Normaliza permisos a formato POSIX ACL (3 chars)
+# - "rx"  -> "r-x"
+# - "rw"  -> "rw-"
+# - "r"   -> "r--"
+# - "--x" -> "--x" (ya OK)
+# - "rwx" -> "rwx"
+normalize_perms() {
+  local p
+  p="$(trim "$1")"
+
+  # Si ya viene con 3 chars tipo r-x / rw- / --- / --x etc.
+  if [[ "$p" =~ ^[r-][w-][x-]$ ]]; then
+    printf "%s" "$p"
+    return 0
   fi
 
-  if [[ "${recursive}" == "true" ]]; then
-    # Recursivo: ACL + Default ACL para herencia en todo lo creado dentro
-    run_cmd setfacl -R -m "u:${user}:${perms}" "${abs_path}"
-    run_cmd setfacl -R -d -m "u:${user}:${perms}" "${abs_path}"
-  else
-    # No recursivo: solo ACL del directorio/archivo existente.
-    # Default ACL aquí es opcional: solo tiene sentido en directorios.
-    run_cmd setfacl -m "u:${user}:${perms}" "${abs_path}"
+  # Si viene abreviado (ej: rx, rw, r, x)
+  local r="-" w="-" x="-"
+  [[ "$p" == *"r"* ]] && r="r"
+  [[ "$p" == *"w"* ]] && w="w"
+  [[ "$p" == *"x"* ]] && x="x"
 
-    if [[ -d "${abs_path}" ]]; then
-      # Si es directorio, ponemos default ACL para que lo nuevo herede.
-      # Si por política NO quieres default aquí, borra este bloque.
-      run_cmd setfacl -d -m "u:${user}:${perms}" "${abs_path}"
-    fi
+  local out="${r}${w}${x}"
+  if [[ ! "$out" =~ ^[r-][w-][x-]$ ]]; then
+    die "Permisos inválidos: '$p' (normalizado: '$out')"
+  fi
+
+  printf "%s" "$out"
+}
+
+resolve_acl_subject() {
+  local raw="$1"
+
+  # Si viene prefijado (u:... o g:...), se respeta
+  if [[ "$raw" =~ ^[ug]: ]]; then
+    printf "%s" "$raw"
+    return 0
+  fi
+
+  # Preferimos grupo si existe
+  if getent group "$raw" >/dev/null 2>&1; then
+    printf "g:%s" "$raw"
+    return 0
+  fi
+
+  # Si existe como usuario, úsalo como usuario
+  if getent passwd "$raw" >/dev/null 2>&1; then
+    printf "u:%s" "$raw"
+    return 0
+  fi
+
+  # Fallback: usuario (AD/LDAP puede resolver)
+  printf "u:%s" "$raw"
+}
+
+warn_if_unknown_subject() {
+  local raw="$1"
+  local subj="$2"
+  local name="${subj#*:}"
+  if ! getent passwd "${name}" >/dev/null 2>&1 && ! getent group "${name}" >/dev/null 2>&1; then
+    log_warn "👤 '${raw}' no existe en getent (se intentará igual: Samba/LDAP/AD podrían resolverlo)."
+  fi
+}
+
+apply_acl_nonrec() {
+  local subject="$1" perms_raw="$2" path="$3"
+  local kind="${subject%%:*}" name="${subject#*:}"
+  local perms
+  perms="$(normalize_perms "$perms_raw")"
+
+  run_cmd setfacl -m "${kind}:${name}:${perms}" "${path}"
+
+  # Default ACL solo aplica a directorios
+  if [[ -d "${path}" && "${DEFAULT_ON_NONRECURSIVE_DIRS}" == "1" ]]; then
+    run_cmd setfacl -d -m "${kind}:${name}:${perms}" "${path}"
+  fi
+}
+
+# Aplica ACL recursivo separando dirs y files (DEFAULT solo en DIRS)
+apply_acl_tree_split() {
+  local subject="$1" dir_perms_raw="$2" file_perms_raw="$3" def_dir_raw="$4" path="$5"
+  local kind="${subject%%:*}" name="${subject#*:}"
+  local dir_perms file_perms def_dir
+  dir_perms="$(normalize_perms "$dir_perms_raw")"
+  file_perms="$(normalize_perms "$file_perms_raw")"
+  def_dir="$(normalize_perms "$def_dir_raw")"
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log_info "🧾 [CMD] find '${path}' -type d -exec setfacl -m ${kind}:${name}:${dir_perms} {} +"
+    log_info "🧾 [CMD] find '${path}' -type d -exec setfacl -d -m ${kind}:${name}:${def_dir} {} +"
+    log_info "🧾 [CMD] find '${path}' -type f -exec setfacl -m ${kind}:${name}:${file_perms} {} +"
+    return 0
+  fi
+
+  find -P "${path}" -xdev -type d -exec setfacl -m "${kind}:${name}:${dir_perms}" {} +
+  find -P "${path}" -xdev -type d -exec setfacl -d -m "${kind}:${name}:${def_dir}" {} +
+  find -P "${path}" -xdev -type f -exec setfacl -m "${kind}:${name}:${file_perms}" {} +
+}
+
+# Recursivo simple (rápido, menos fino)
+apply_acl_tree_simple() {
+  local subject="$1" perms_raw="$2" path="$3"
+  local kind="${subject%%:*}" name="${subject#*:}"
+  local perms
+  perms="$(normalize_perms "$perms_raw")"
+
+  run_cmd setfacl -R -m "${kind}:${name}:${perms}" "${path}"
+  # Default ACL (solo en directorios): setfacl -R -d lo intenta sobre archivos también y puede avisar.
+  # En SIMPLE_RECURSIVE aceptamos ese tradeoff.
+  run_cmd setfacl -R -d -m "${kind}:${name}:${perms}" "${path}"
+}
+
+apply_deny_tree() {
+  local subject="$1" path="$2"
+  if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then
+    apply_acl_tree_simple "${subject}" "---" "${path}"
+  else
+    apply_acl_tree_split "${subject}" "---" "---" "---" "${path}"
   fi
 }
 
 # -------------------------
-# MAIN FLOW
+# Parse INI
 # -------------------------
-log_info "Iniciando apply_acls (DRY_RUN=${DRY_RUN})"
+declare -A GLOBAL
+declare -a SPECIALTIES
 
-# Validación general del repo/config (si tu validate.sh hace más cosas, bien)
-if [[ -x "${REPO_DIR}/scripts/validate.sh" ]]; then
-  "${REPO_DIR}/scripts/validate.sh" | tee -a "${LOG_FILE}"
-else
-  log_warn "No existe validate.sh ejecutable, se omite validación previa."
-fi
+declare -A PROFILE_base_project
+declare -A PROFILE_base_wip
+declare -A PROFILE_wip_full_control
+declare -A PROFILE_write
 
-# Verificar BASE
-if [[ -z "${BASE:-}" ]]; then
-  die "BASE no está definido en config/projects.conf"
-fi
-if [[ ! -d "${BASE}" ]]; then
-  die "BASE no existe o no es directorio: ${BASE}"
-fi
+parse_ini() {
+  [[ -f "${INI_FILE}" ]] || die "INI no existe: ${INI_FILE}"
 
-# Cargar archivos de reglas
+  local section=""
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    local line
+    line="$(trim "$raw")"
+
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^\; ]] && continue
+    [[ "$line" =~ ^# ]] && continue
+
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      section="${BASH_REMATCH[1]}"
+      section="$(trim "$section")"
+      continue
+    fi
+
+    if [[ "$section" == "SPECIALTIES" ]]; then
+      line="${line%%;*}"
+      line="$(trim "$line")"
+      [[ -z "$line" ]] && continue
+      SPECIALTIES+=("$line")
+      continue
+    fi
+
+    if [[ "$line" == *"="* ]]; then
+      local key="${line%%=*}"
+      local val="${line#*=}"
+      key="$(trim "$key")"
+      val="$(trim "$val")"
+
+      if [[ "$section" == "GLOBAL" ]]; then
+        GLOBAL["$key"]="$val"
+      else
+        case "$key" in
+          base_project)     PROFILE_base_project["$section"]="$val" ;;
+          base_wip)         PROFILE_base_wip["$section"]="$val" ;;
+          wip_full_control) PROFILE_wip_full_control["$section"]="$val" ;;
+          write)            PROFILE_write["$section"]="$val" ;;
+          *) : ;;
+        esac
+      fi
+    fi
+  done < "${INI_FILE}"
+}
+
+split_csv() {
+  local csv="$1"
+  local -n out="$2"
+  out=()
+  IFS=',' read -r -a out <<< "$csv"
+  for i in "${!out[@]}"; do
+    out[$i]="$(trim "${out[$i]}")"
+  done
+}
+
+# -------------------------
+# MAIN
+# -------------------------
+log_info "🚀 Iniciando apply_acls (DRY_RUN=${DRY_RUN}) INI=${INI_FILE} SIMPLE_RECURSIVE=${SIMPLE_RECURSIVE}"
+
+command -v setfacl >/dev/null 2>&1 || die "setfacl no está instalado o no está en PATH"
+command -v getent  >/dev/null 2>&1 || die "getent no está disponible"
+command -v find    >/dev/null 2>&1 || die "find no está disponible"
+
+parse_ini
+
+ROOT="${GLOBAL[root]:-}"
+PROJECT_GLOB="${GLOBAL[project_glob]:-*}"
+WIP_FOLDER="${GLOBAL[wip_folder]:-01_WIP}"
+
+BASE_ROOT_DEFAULT="${GLOBAL[base_root]:-rx}"
+BASE_PROJECT_DEFAULT="${GLOBAL[base_project]:-rx}"
+BASE_WIP_DEFAULT="${GLOBAL[base_wip]:-rx}"
+
+WRITE_DIR="${GLOBAL[write_dir]:-rwx}"
+WRITE_FILE="${GLOBAL[write_file]:-rw-}"
+DEF_DIR="${GLOBAL[default_dir]:-${WRITE_DIR}}"
+
+HIDE_NON_WRITE="${GLOBAL[hide_non_write]:-1}"
+
+[[ -n "${ROOT}" ]] || die "GLOBAL.root no definido en INI"
+[[ -d "${ROOT}" ]] || die "ROOT no existe o no es directorio: ${ROOT}"
+[[ "${#SPECIALTIES[@]}" -gt 0 ]] || die "No hay SPECIALTIES en el INI"
+
+EXPECTED_ROOT="/srv/samba/02_Proyectos"
+[[ "${ROOT}" == "${EXPECTED_ROOT}" ]] || die "ROOT='${ROOT}' no coincide con EXPECTED_ROOT='${EXPECTED_ROOT}'. Abortando."
+
+# Perfiles (secciones encontradas)
+declare -a PROFILES
+for p in \
+  "${!PROFILE_base_project[@]}" \
+  "${!PROFILE_base_wip[@]}" \
+  "${!PROFILE_wip_full_control[@]}" \
+  "${!PROFILE_write[@]}"
+do
+  PROFILES+=("$p")
+done
+mapfile -t PROFILES < <(printf "%s\n" "${PROFILES[@]}" | awk '!seen[$0]++' | sort)
+[[ "${#PROFILES[@]}" -gt 0 ]] || die "No hay perfiles en el INI"
+
+# Proyectos existentes
 shopt -s nullglob
-rule_files=("${RULES_DIR}"/*.rules)
+# shellcheck disable=SC2206
+PROJECT_PATHS=( ${ROOT}/${PROJECT_GLOB} )
+shopt -u nullglob
+[[ "${#PROJECT_PATHS[@]}" -gt 0 ]] || die "No hay proyectos que matcheen: ${ROOT}/${PROJECT_GLOB}"
 
-if [[ "${#rule_files[@]}" -eq 0 ]]; then
-  die "No hay archivos de reglas en ${RULES_DIR}"
-fi
+log_info "📁 Proyectos encontrados: ${#PROJECT_PATHS[@]}"
+log_info "👥 Perfiles encontrados: ${#PROFILES[@]}"
 
-# Procesar cada archivo .rules
-for rf in "${rule_files[@]}"; do
-  log_info "Procesando reglas: ${rf}"
+APPLIED=0
+SKIPPED_NO_WIP=0
+SKIPPED_NO_SP=0
 
-  # Leer línea a línea
-  while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
-    # Quitar espacios finales, y trim completo
-    line="$(trim "${raw_line}")"
+for profile in "${PROFILES[@]}"; do
+  base_project="${PROFILE_base_project[$profile]:-${BASE_PROJECT_DEFAULT}}"
+  base_wip="${PROFILE_base_wip[$profile]:-${BASE_WIP_DEFAULT}}"
+  wip_full="${PROFILE_wip_full_control[$profile]:-}"
+  write_csv="${PROFILE_write[$profile]:-}"
 
-    # Saltar vacías / comentarios
-    [[ -z "${line}" ]] && continue
-    [[ "${line}" =~ ^# ]] && continue
+  subject="$(resolve_acl_subject "$profile")"
+  warn_if_unknown_subject "$profile" "$subject"
 
-    # Parseo estricto por ';'
-    IFS=';' read -r user perms rel_path recursive extra <<< "${line}"
+  log_info "🧩 Perfil=${profile} subject=${subject} base_root=${BASE_ROOT_DEFAULT} base_project=${base_project} base_wip=${base_wip} wip_full=${wip_full:-N/A}"
 
-    user="$(trim "${user:-}")"
-    perms="$(trim "${perms:-}")"
-    rel_path="$(trim "${rel_path:-}")"
-    recursive="$(trim "${recursive:-}")"
+  # base_root: listar proyectos en el root del share
+  apply_acl_nonrec "$subject" "${BASE_ROOT_DEFAULT}" "$ROOT"
+  ((++APPLIED))
+  log_ok "📍 base_root: ${profile} ${BASE_ROOT_DEFAULT} ${ROOT}"
 
-    # Si vino "extra" significa que hay más de 4 campos (regla malformada)
-    if [[ -n "${extra:-}" ]]; then
-      log_warn "Regla inválida (demasiados campos): ${line}"
+  # build write set
+  unset -v is_write 2>/dev/null || true
+  declare -A is_write
+  if [[ -n "${write_csv}" ]]; then
+    declare -a write_list
+    split_csv "${write_csv}" write_list
+    for sp in "${write_list[@]}"; do
+      [[ -n "$sp" ]] && is_write["$sp"]=1
+    done
+  fi
+
+  for proj_path in "${PROJECT_PATHS[@]}"; do
+    [[ -d "$proj_path" ]] || continue
+    wip_path="${proj_path}/${WIP_FOLDER}"
+
+    # base_project: listar y entrar al proyecto
+    apply_acl_nonrec "$subject" "$base_project" "$proj_path"
+    ((++APPLIED))
+    log_ok "📍 base_project: ${profile} ${base_project} ${proj_path}"
+
+    # WIP existe?
+    if [[ ! -d "$wip_path" ]]; then
+      ((++SKIPPED_NO_WIP))
+      log_warn "📁 WIP no existe (se omite): ${wip_path}"
       continue
     fi
 
-    # Validación campos mínimos
-    if [[ -z "${user}" || -z "${perms}" || -z "${rel_path}" || -z "${recursive}" ]]; then
-      log_warn "Regla inválida (faltan campos): ${line}"
+    # base_wip: permitir entrar/listar WIP
+    apply_acl_nonrec "$subject" "$base_wip" "$wip_path"
+    ((++APPLIED))
+    log_ok "🧷 base_wip: ${profile} ${base_wip} ${wip_path}"
+
+    # BIM full control
+    if [[ -n "$wip_full" ]]; then
+      if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then
+        apply_acl_tree_simple "$subject" "$wip_full" "$wip_path"
+      else
+        apply_acl_tree_split "$subject" "rwx" "rw-" "rwx" "$wip_path"
+      fi
+      ((++APPLIED))
+      log_ok "🔓 wip_full_control: ${profile} ${wip_full} ${wip_path} (recursivo)"
       continue
     fi
 
-    # Validación booleana
-    if ! is_bool "${recursive}"; then
-      log_warn "Regla inválida (recursive debe ser true/false): ${line}"
-      continue
-    fi
+    # Perfiles restringidos: write vs deny por especialidad
+    for sp in "${SPECIALTIES[@]}"; do
+      sp_path="${wip_path}/${sp}"
+      [[ -e "$sp_path" ]] || { ((++SKIPPED_NO_SP)); continue; }
 
-    # Validación permisos (ligera, para atrapar typos típicos)
-    # Si quieres permitir 'rx' también, ya está cubierto por regex.
-    if ! is_perms "${perms}"; then
-      log_warn "Permisos sospechosos '${perms}' (revísalo). Regla: ${line}"
-      # no abortamos, solo avisamos
-    fi
-
-    # Construir ruta absoluta
-    abs_path="${BASE}/${rel_path}"
-
-    # Requisito clave: si NO existe, se omite sin drama.
-    if [[ ! -e "${abs_path}" ]]; then
-      log_warn "Ruta no existe (se omite): ${abs_path}"
-      continue
-    fi
-
-    # Aplicar ACL
-    apply_acl "${user}" "${perms}" "${abs_path}" "${recursive}"
-
-    log_ok "Aplicado: user=${user} perms=${perms} path=${abs_path} recursive=${recursive}"
-  done < "${rf}"
+      if [[ "${is_write[$sp]+x}" ]]; then
+        if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then
+          apply_acl_tree_simple "$subject" "rwx" "$sp_path"
+        else
+          apply_acl_tree_split "$subject" "${WRITE_DIR}" "${WRITE_FILE}" "${DEF_DIR}" "$sp_path"
+        fi
+        ((++APPLIED))
+        log_ok "✍️ WRITE: ${profile} ${WRITE_DIR}/${WRITE_FILE} ${sp_path}"
+      else
+        if [[ "${HIDE_NON_WRITE}" == "1" ]]; then
+          apply_deny_tree "$subject" "$sp_path"
+          ((++APPLIED))
+          log_ok "🙈 HIDDEN: ${profile} --- ${sp_path}"
+        fi
+      fi
+    done
+  done
 done
 
-log_info "apply_acls finalizado"
+log_ok "📊 Resumen: APPLIED=${APPLIED} SKIPPED_NO_WIP=${SKIPPED_NO_WIP} SKIPPED_NO_SPECIALTY_PATH=${SKIPPED_NO_SP}"
+log_info "🏁 apply_acls finalizado"
