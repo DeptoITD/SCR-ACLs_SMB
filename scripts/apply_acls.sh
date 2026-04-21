@@ -281,6 +281,14 @@ HIDE_NON_WRITE="${GLOBAL[hide_non_write]:-1}"
 EXPECTED_ROOT="/srv/samba/02_Proyectos"
 [[ "${ROOT}" == "${EXPECTED_ROOT}" ]] || die "ROOT='${ROOT}' no coincide con EXPECTED_ROOT='${EXPECTED_ROOT}'. Abortando."
 
+# Backup automático antes de tocar cualquier ACL (sobreescribe el anterior)
+_backup_file="${REPO_DIR}/backups/acl_latest.facl"
+mkdir -p "${REPO_DIR}/backups"
+log_info "💾 Generando backup de ACLs en: ${_backup_file}"
+[[ "${DRY_RUN}" == "1" ]] || getfacl -R --absolute-names "${ROOT}" > "${_backup_file}"
+log_ok "💾 Backup listo: ${_backup_file}"
+unset _backup_file
+
 # Perfiles (secciones encontradas)
 declare -a PROFILES
 for p in \
