@@ -184,6 +184,7 @@ apply_deny_tree() {
 declare -A GLOBAL
 declare -a SPECIALTIES
 
+declare -A PROFILE_base_root
 declare -A PROFILE_base_project
 declare -A PROFILE_base_wip
 declare -A PROFILE_wip_full_control
@@ -225,6 +226,7 @@ parse_ini() {
         GLOBAL["$key"]="$val"
       else
         case "$key" in
+          base_root)        PROFILE_base_root["$section"]="$val" ;;
           base_project)     PROFILE_base_project["$section"]="$val" ;;
           base_wip)         PROFILE_base_wip["$section"]="$val" ;;
           wip_full_control) PROFILE_wip_full_control["$section"]="$val" ;;
@@ -281,6 +283,7 @@ EXPECTED_ROOT="/srv/samba/02_Proyectos"
 # Perfiles (secciones encontradas)
 declare -a PROFILES
 for p in \
+  "${!PROFILE_base_root[@]}" \
   "${!PROFILE_base_project[@]}" \
   "${!PROFILE_base_wip[@]}" \
   "${!PROFILE_wip_full_control[@]}" \
@@ -306,6 +309,7 @@ SKIPPED_NO_WIP=0
 SKIPPED_NO_SP=0
 
 for profile in "${PROFILES[@]}"; do
+  base_root="${PROFILE_base_root[$profile]:-${BASE_ROOT_DEFAULT}}"
   base_project="${PROFILE_base_project[$profile]:-${BASE_PROJECT_DEFAULT}}"
   base_wip="${PROFILE_base_wip[$profile]:-${BASE_WIP_DEFAULT}}"
   wip_full="${PROFILE_wip_full_control[$profile]:-}"
@@ -314,12 +318,12 @@ for profile in "${PROFILES[@]}"; do
   subject="$(resolve_acl_subject "$profile")"
   warn_if_unknown_subject "$profile" "$subject"
 
-  log_info "🧩 Perfil=${profile} subject=${subject} base_root=${BASE_ROOT_DEFAULT} base_project=${base_project} base_wip=${base_wip} wip_full=${wip_full:-N/A}"
+  log_info "🧩 Perfil=${profile} subject=${subject} base_root=${base_root} base_project=${base_project} base_wip=${base_wip} wip_full=${wip_full:-N/A}"
 
   # base_root: listar proyectos en el root del share
-  apply_acl_nonrec "$subject" "${BASE_ROOT_DEFAULT}" "$ROOT"
+  apply_acl_nonrec "$subject" "${base_root}" "$ROOT"
   ((++APPLIED))
-  log_ok "📍 base_root: ${profile} ${BASE_ROOT_DEFAULT} ${ROOT}"
+  log_ok "📍 base_root: ${profile} ${base_root} ${ROOT}"
 
   # build write set
   unset -v is_write 2>/dev/null || true
