@@ -91,3 +91,35 @@ Se separa la lógica de aplicación de permisos en dos scripts especializados:
   confirmación explícita.
 
 ---
+
+## Decisión 9: Recorrido DFS interactivo para proyectos no estándar
+
+Se reemplaza el esquema de navegación anterior por un recorrido DFS (depth-first)
+completo del árbol del proyecto. En cada nodo el operador elige perfiles con
+permiso de edición; luego el script ofrece un atajo recursivo: si los mismos
+permisos aplican a todo el subárbol, se aplican en bloque sin seguir bajando.
+Esto reduce drásticamente la cantidad de preguntas en árboles profundos.
+
+---
+
+## Decisión 10: Modelo de tres niveles de permiso para proyectos no estándar
+
+La implementación inicial de `apply_acls_nonstandard.sh` solo distinguía dos
+estados: editar (`rwx`) o negar (`---`).
+
+Se incorpora un tercer nivel intermedio — **ver/entrar** (`r-x`) — para cubrir
+el caso habitual en árboles profundos: un perfil no edita en una carpeta padre
+pero necesita atravesarla para llegar a una subcarpeta donde sí tiene permisos.
+
+Resultado final por perfil en cada carpeta:
+
+| Nivel        | Dirs | Archivos | Efecto Samba           |
+|-------------|------|---------|------------------------|
+| Editar       | `rwx` | `rw-`   | Visible y editable     |
+| Ver/entrar   | `r-x` | `r--`   | Visible, solo lectura  |
+| Oculto       | `---` | `---`   | Invisible en Windows   |
+
+Sin este tercer nivel, un perfil negado en el padre nunca podría acceder
+a subcarpetas aunque tuviese permisos explícitos en ellas.
+
+---

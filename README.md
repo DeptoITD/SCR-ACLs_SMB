@@ -62,6 +62,43 @@ sudo bash scripts/backup_restore_acl.sh restore backups/acl_before_YYYYMMDD_HHMM
 
 ---
 
+### Flujo detallado — proyectos no estándar
+
+Cuando `perfilar.sh` detecta que un proyecto no tiene `01_WIP` en el primer nivel, invoca `apply_acls_nonstandard.sh`. Este script recorre el árbol de carpetas en profundidad (DFS) de forma interactiva:
+
+**En cada carpeta el script hace dos preguntas:**
+
+1. **¿Quién puede EDITAR aquí?** — perfiles seleccionados reciben `rwx` en el directorio, `rwx` como ACL por defecto (archivos nuevos) y `rw-` en archivos existentes del nivel actual.
+
+2. **De los restantes, ¿quién puede VER/ENTRAR?** — perfiles que no editan pero necesitan navegar la carpeta (por ejemplo, para llegar a una subcarpeta donde sí tienen permisos) reciben `r-x` en el directorio, `r-x` como ACL por defecto y `r--` en archivos del nivel actual.
+
+Los perfiles no asignados en ninguna pregunta reciben `---` y la carpeta queda oculta en Windows vía `hide unreadable = yes` de Samba.
+
+**Atajo recursivo:**
+
+Después de cada selección, si la carpeta tiene subcarpetas el script las lista y pregunta:
+
+```
+¿Aplicar los MISMOS permisos a TODO lo que hay debajo? [s/n]
+```
+
+- `s` — aplica los permisos de forma recursiva sobre todo el subárbol sin seguir bajando.
+- `n` — desciende a cada subcarpeta y repite la selección nivel por nivel.
+
+**Vista previa y confirmación:**
+
+Una vez recorrido el árbol completo, el script muestra todos los comandos `setfacl` que se ejecutarán (equivalente a un dry-run) y pide confirmación explícita (`yes`) antes de aplicar cualquier cambio.
+
+**Resumen de tipos de permiso que genera el script:**
+
+| Tipo | Directorios | Archivos | Efecto en Samba |
+|------|------------|---------|-----------------|
+| `WRITE_DIR` / `WRITE_REC` | `rwx` | `rw-` | Visible y editable |
+| `READ_DIR` / `READ_REC` | `r-x` | `r--` | Visible, solo lectura |
+| `DENY_DIR` / `DENY_REC` | `---` | `---` | Oculto (invisible) |
+
+---
+
 ## 4. Diagramas
 ### Diagrama de componentes del sistema de gestión de ACLs
 
