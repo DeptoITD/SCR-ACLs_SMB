@@ -296,6 +296,13 @@ shopt -s nullglob
 # shellcheck disable=SC2206
 PROJECT_PATHS=( ${ROOT}/${PROJECT_GLOB} )
 shopt -u nullglob
+
+# Si se pasa TARGET_PROJECT, filtra a ese único proyecto
+if [[ -n "${TARGET_PROJECT:-}" ]]; then
+  [[ -d "${ROOT}/${TARGET_PROJECT}" ]] || die "TARGET_PROJECT no existe: ${ROOT}/${TARGET_PROJECT}"
+  PROJECT_PATHS=( "${ROOT}/${TARGET_PROJECT}" )
+fi
+
 [[ "${#PROJECT_PATHS[@]}" -gt 0 ]] || die "No hay proyectos que matcheen: ${ROOT}/${PROJECT_GLOB}"
 
 log_info "📁 Proyectos encontrados: ${#PROJECT_PATHS[@]}"
