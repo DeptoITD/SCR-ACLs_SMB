@@ -311,18 +311,6 @@ fi
 log_info "📁 Proyectos encontrados: ${#PROJECT_PATHS[@]}"
 log_info "👥 Perfiles encontrados: ${#PROFILES[@]}"
 
-# -------------------------
-# Soporte: acceso total desde la raíz (paso único, fuera del loop de perfiles)
-# -------------------------
-_soporte_subj="$(resolve_acl_subject "${SOPORTE_GROUP}")"
-apply_acl_nonrec "${_soporte_subj}" "rwx" "${ROOT}"
-for _proj in "${PROJECT_PATHS[@]}"; do
-  [[ -d "${_proj}" ]] || continue
-  apply_acl_tree_split "${_soporte_subj}" "rwx" "rw-" "rwx" "${_proj}"
-done
-log_ok "🔑 soporte (${_soporte_subj}): rwx aplicado sobre ${ROOT} y ${#PROJECT_PATHS[@]} proyecto(s)"
-unset _soporte_subj _proj
-
 APPLIED=0
 SKIPPED_NO_WIP=0
 SKIPPED_NO_SP=0
@@ -410,6 +398,18 @@ for profile in "${PROFILES[@]}"; do
     done
   done
 done
+
+# -------------------------
+# Soporte: acceso total desde la raíz (siempre al final, pisa cualquier regla del loop)
+# -------------------------
+_soporte_subj="$(resolve_acl_subject "${SOPORTE_GROUP}")"
+apply_acl_nonrec "${_soporte_subj}" "rwx" "${ROOT}"
+for _proj in "${PROJECT_PATHS[@]}"; do
+  [[ -d "${_proj}" ]] || continue
+  apply_acl_tree_split "${_soporte_subj}" "rwx" "rw-" "rwx" "${_proj}"
+done
+log_ok "🔑 soporte (${_soporte_subj}): rwx aplicado sobre ${ROOT} y ${#PROJECT_PATHS[@]} proyecto(s)"
+unset _soporte_subj _proj
 
 log_ok "📊 Resumen: APPLIED=${APPLIED} SKIPPED_NO_WIP=${SKIPPED_NO_WIP} SKIPPED_NO_SPECIALTY_PATH=${SKIPPED_NO_SP}"
 log_info "🏁 apply_acls finalizado"
