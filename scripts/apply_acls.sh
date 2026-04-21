@@ -181,6 +181,13 @@ apply_deny_tree() {
   fi
 }
 
+# Garantiza que el owner (user::) siempre tenga rwx y lo herede
+ensure_owner_rwx() {
+  local path="$1"
+  run_cmd setfacl -m "user::rwx" "${path}"
+  [[ -d "${path}" ]] && run_cmd setfacl -d -m "user::rwx" "${path}"
+}
+
 # -------------------------
 # Parse INI
 # -------------------------
@@ -347,6 +354,9 @@ for profile in "${PROFILES[@]}"; do
     [[ -d "$proj_path" ]] || continue
     wip_path="${proj_path}/${WIP_FOLDER}"
 
+    # owner siempre rwx antes de cualquier otra ACL
+    ensure_owner_rwx "$proj_path"
+
     # base_project: listar y entrar al proyecto
     apply_acl_nonrec "$subject" "$base_project" "$proj_path"
     ((++APPLIED))
@@ -358,6 +368,9 @@ for profile in "${PROFILES[@]}"; do
       log_warn "📁 WIP no existe (se omite): ${wip_path}"
       continue
     fi
+
+    # owner siempre rwx antes de cualquier otra ACL
+    ensure_owner_rwx "$wip_path"
 
     # base_wip: permitir entrar/listar WIP
     apply_acl_nonrec "$subject" "$base_wip" "$wip_path"
@@ -380,6 +393,8 @@ for profile in "${PROFILES[@]}"; do
     for sp in "${SPECIALTIES[@]}"; do
       sp_path="${wip_path}/${sp}"
       [[ -e "$sp_path" ]] || { ((++SKIPPED_NO_SP)); continue; }
+
+      ensure_owner_rwx "$sp_path"
 
       if [[ "${is_write[$sp]+x}" ]]; then
         if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then
