@@ -181,6 +181,13 @@ apply_deny_tree() {
   fi
 }
 
+# Garantiza que el owner (user::) siempre tenga rwx y lo herede
+ensure_owner_rwx() {
+  local path="$1"
+  run_cmd setfacl -m "user::rwx" "${path}"
+  [[ -d "${path}" ]] && run_cmd setfacl -d -m "user::rwx" "${path}"
+}
+
 # -------------------------
 # Parse INI
 # -------------------------
@@ -281,6 +288,8 @@ HIDE_NON_WRITE="${GLOBAL[hide_non_write]:-1}"
 EXPECTED_ROOT="/srv/samba/02_Proyectos"
 [[ "${ROOT}" == "${EXPECTED_ROOT}" ]] || die "ROOT='${ROOT}' no coincide con EXPECTED_ROOT='${EXPECTED_ROOT}'. Abortando."
 
+mkdir -p "${REPO_DIR}/backups"
+
 # Perfiles (secciones encontradas)
 declare -a PROFILES
 for p in \
@@ -310,6 +319,39 @@ fi
 
 log_info "📁 Proyectos encontrados: ${#PROJECT_PATHS[@]}"
 log_info "👥 Perfiles encontrados: ${#PROFILES[@]}"
+
+# -----------------------------------------------------------------------
+# PASO 0 + PASO 1 — Backup y normalización por proyecto (antes del loop)
+# -----------------------------------------------------------------------
+for proj_path in "${PROJECT_PATHS[@]}"; do
+  [[ -d "$proj_path" ]] || continue
+  proj_name="$(basename "$proj_path")"
+  wip_path="${proj_path}/${WIP_FOLDER}"
+  backup_file="${REPO_DIR}/backups/acl_${proj_name}.facl"
+
+  # PASO 0 — BACKUP
+  log_info "💾 [PASO 0] Backup de ${proj_name} → ${backup_file}"
+  if [[ "${DRY_RUN}" != "1" ]]; then
+    getfacl -R "${proj_path}" > "${backup_file}"
+  fi
+  log_ok "💾 Para revertir: sudo setfacl --restore=${backup_file}"
+
+  # PASO 1 — NORMALIZACIÓN de raíz del proyecto
+  log_info "🔧 [PASO 1] Normalizando ${proj_path}"
+  run_cmd chown soporte:BIM "${proj_path}"
+  run_cmd chmod 2770 "${proj_path}"
+  run_cmd setfacl -b "${proj_path}"
+  run_cmd setfacl -m "user::rwx,group::rwx,other::---,d:user::rwx,d:group::rwx,d:other::---" "${proj_path}"
+
+  # PASO 1 — NORMALIZACIÓN de 01_WIP (si existe)
+  if [[ -d "${wip_path}" ]]; then
+    log_info "🔧 [PASO 1] Normalizando ${wip_path}"
+    run_cmd chown soporte:BIM "${wip_path}"
+    run_cmd chmod 2770 "${wip_path}"
+    run_cmd setfacl -b "${wip_path}"
+    run_cmd setfacl -m "user::rwx,group::rwx,other::---,d:user::rwx,d:group::rwx,d:other::---" "${wip_path}"
+  fi
+done
 
 APPLIED=0
 SKIPPED_NO_WIP=0
@@ -379,6 +421,8 @@ for profile in "${PROFILES[@]}"; do
     for sp in "${SPECIALTIES[@]}"; do
       sp_path="${wip_path}/${sp}"
       [[ -e "$sp_path" ]] || { ((++SKIPPED_NO_SP)); continue; }
+
+      ensure_owner_rwx "$sp_path"
 
       if [[ "${is_write[$sp]+x}" ]]; then
         if [[ "${SIMPLE_RECURSIVE}" == "1" ]]; then

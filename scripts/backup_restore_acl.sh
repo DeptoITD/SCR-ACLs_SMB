@@ -37,9 +37,9 @@ case "${cmd}" in
 
     [[ -d "${target}" ]] || die "Ruta objetivo no existe: ${target}"
 
-    # Si no te pasan archivo, genera uno en backups/
+    # Si no te pasan archivo, usa nombre fijo (siempre sobreescribe el anterior)
     if [[ -z "${file}" ]]; then
-      file="${BACKUP_DIR}/acl_before_$(date +%Y%m%d_%H%M%S).facl"
+      file="${BACKUP_DIR}/acl_latest.facl"
     fi
 
     # Seguridad básica del archivo resultante
