@@ -62,10 +62,14 @@ sudo bash scripts/backup_restore_acl.sh restore backups/acl_before_YYYYMMDD_HHMM
 
 ---
 
-## 4. Diagrama de secuencia (Entradas y salidas)
+## 4. Diagramas
+### Diagrama de componentes del sistema de gestión de ACLs
 
-![Diagrama de secuencia del sistema de gestión de ACLs](docs/seq.png)
-
+![Diagrama de componentes del sistema de gestión de ACLs](docs/comp.png)
+### Diagrama de secuencia (FLUJO 1) del sistema de gestión de ACLs
+![Diagrama de secuencia (FLUJO 1) del sistema de gestión de ACLs](docs/Fl1.png)
+### Diagrama de secuencia (FLUJO 2) del sistema de gestión de ACLs
+![Diagrama de secuencia  (FLUJO 2) del sistema de gestión de ACLs](docs/Fl2.png)
 ---
 
 ## 5. Estructura del repositorio
