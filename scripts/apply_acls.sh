@@ -288,13 +288,7 @@ HIDE_NON_WRITE="${GLOBAL[hide_non_write]:-1}"
 EXPECTED_ROOT="/srv/samba/02_Proyectos"
 [[ "${ROOT}" == "${EXPECTED_ROOT}" ]] || die "ROOT='${ROOT}' no coincide con EXPECTED_ROOT='${EXPECTED_ROOT}'. Abortando."
 
-# Backup automático antes de tocar cualquier ACL (sobreescribe el anterior)
-_backup_file="${REPO_DIR}/backups/acl_latest.facl"
 mkdir -p "${REPO_DIR}/backups"
-log_info "💾 Generando backup de ACLs en: ${_backup_file}"
-[[ "${DRY_RUN}" == "1" ]] || getfacl -R --absolute-names "${ROOT}" > "${_backup_file}"
-log_ok "💾 Backup listo: ${_backup_file}"
-unset _backup_file
 
 # Perfiles (secciones encontradas)
 declare -a PROFILES
@@ -318,6 +312,39 @@ shopt -u nullglob
 
 log_info "📁 Proyectos encontrados: ${#PROJECT_PATHS[@]}"
 log_info "👥 Perfiles encontrados: ${#PROFILES[@]}"
+
+# -----------------------------------------------------------------------
+# PASO 0 + PASO 1 — Backup y normalización por proyecto (antes del loop)
+# -----------------------------------------------------------------------
+for proj_path in "${PROJECT_PATHS[@]}"; do
+  [[ -d "$proj_path" ]] || continue
+  proj_name="$(basename "$proj_path")"
+  wip_path="${proj_path}/${WIP_FOLDER}"
+  backup_file="${REPO_DIR}/backups/acl_${proj_name}.facl"
+
+  # PASO 0 — BACKUP
+  log_info "💾 [PASO 0] Backup de ${proj_name} → ${backup_file}"
+  if [[ "${DRY_RUN}" != "1" ]]; then
+    getfacl -R "${proj_path}" > "${backup_file}"
+  fi
+  log_ok "💾 Para revertir: sudo setfacl --restore=${backup_file}"
+
+  # PASO 1 — NORMALIZACIÓN de raíz del proyecto
+  log_info "🔧 [PASO 1] Normalizando ${proj_path}"
+  run_cmd chown soporte:BIM "${proj_path}"
+  run_cmd chmod 2770 "${proj_path}"
+  run_cmd setfacl -b "${proj_path}"
+  run_cmd setfacl -m "user::rwx,group::rwx,other::---,d:user::rwx,d:group::rwx,d:other::---" "${proj_path}"
+
+  # PASO 1 — NORMALIZACIÓN de 01_WIP (si existe)
+  if [[ -d "${wip_path}" ]]; then
+    log_info "🔧 [PASO 1] Normalizando ${wip_path}"
+    run_cmd chown soporte:BIM "${wip_path}"
+    run_cmd chmod 2770 "${wip_path}"
+    run_cmd setfacl -b "${wip_path}"
+    run_cmd setfacl -m "user::rwx,group::rwx,other::---,d:user::rwx,d:group::rwx,d:other::---" "${wip_path}"
+  fi
+done
 
 APPLIED=0
 SKIPPED_NO_WIP=0
@@ -354,9 +381,6 @@ for profile in "${PROFILES[@]}"; do
     [[ -d "$proj_path" ]] || continue
     wip_path="${proj_path}/${WIP_FOLDER}"
 
-    # owner siempre rwx antes de cualquier otra ACL
-    ensure_owner_rwx "$proj_path"
-
     # base_project: listar y entrar al proyecto
     apply_acl_nonrec "$subject" "$base_project" "$proj_path"
     ((++APPLIED))
@@ -368,9 +392,6 @@ for profile in "${PROFILES[@]}"; do
       log_warn "📁 WIP no existe (se omite): ${wip_path}"
       continue
     fi
-
-    # owner siempre rwx antes de cualquier otra ACL
-    ensure_owner_rwx "$wip_path"
 
     # base_wip: permitir entrar/listar WIP
     apply_acl_nonrec "$subject" "$base_wip" "$wip_path"
