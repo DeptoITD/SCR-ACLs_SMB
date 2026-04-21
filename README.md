@@ -2,140 +2,87 @@
 
 ## 1. Propósito
 
-Este repositorio implementa un **sistema declarativo, idempotente y auditable** para la gestión de permisos **ACL POSIX** sobre proyectos alojados en un servidor **Linux (Ubuntu)** con almacenamiento compartido vía **Samba**.
+Este repositorio implementa un sistema declarativo, idempotente y auditable para la gestión de permisos ACL POSIX sobre proyectos alojados en un servidor Linux (Ubuntu) con almacenamiento compartido vía Samba.
 
-El propósito del sistema es **estandarizar y automatizar** la asignación de permisos por **perfil** y **proyecto**, eliminando la gestión manual basada en comandos `setfacl`, la cual generaba:
-
-- alto riesgo de error humano,
-- inconsistencias entre proyectos y servidores,
-- baja trazabilidad,
-- dificultad para auditoría y reversión de cambios.
-
-El sistema está diseñado para ejecutarse de forma segura incluso cuando:
-- existen proyectos sin estructura completa,
-- algunas especialidades no están creadas aún,
-- los usuarios o grupos provienen de **Samba, Active Directory o LDAP**,
-- el script se ejecuta múltiples veces sin efectos acumulativos.
+El propósito es estandarizar y automatizar la asignación de permisos por perfil y proyecto, eliminando la gestión manual basada en comandos `setfacl`, la cual generaba alto riesgo de error humano, inconsistencias entre proyectos y baja trazabilidad.
 
 ---
 
 ## 2. Descripción técnica
 
-El sistema se basa en un **modelo declarativo deny-by-default**, donde los permisos se definen en archivos de configuración versionados y se aplican mediante un motor controlado.
+El sistema opera bajo un modelo **DENY-BY-DEFAULT**: todo acceso debe ser explícito. Lo no declarado queda sin permisos (`---`).
 
-Implementación (modelo **DENY-BY-DEFAULT**):
-
-- En cada proyecto, todos los perfiles pueden **ver y entrar** a `01_WIP` (`base_wip=rx`), para estandarizar navegación.
-- Dentro de `01_WIP`, cada perfil solo tiene permisos **de escritura** (`write`) en las especialidades declaradas.
-- Las especialidades no autorizadas reciben ACL explícita `---` para eliminar permisos residuales y evitar “apariciones”.
-- Para que las carpetas no autorizadas realmente **no aparezcan en el explorador de Windows**, el share de Samba debe tener `hide unreadable = yes`.
-- El perfil BIM es la única excepción con control total sobre todo el WIP (`wip_full_control`).
-
-
-### Alcance técnico
-
-El sistema **solo puede operar** sobre el siguiente árbol de directorios:
+El árbol de directorios sobre el que opera es:
 
 ```
-/srv/samba/02_Proyectos
+/srv/samba/02_Proyectos/<PROYECTO>/01_WIP/<ESPECIALIDAD>
 ```
 
-Existe una validación dura que aborta la ejecución si el `root` configurado no coincide exactamente con esta ruta.
-Principio de seguridad
+**Proyectos con estructura estándar** (`01_WIP` en el primer nivel):
+- Los permisos se definen en `config/acls.ini` por perfil y especialidad.
+- Cada perfil obtiene `r-x` en la raíz, en el proyecto y en `01_WIP`.
+- Las especialidades declaradas en `write` reciben `rwx` (dirs) / `rw-` (archivos).
+- Las especialidades no declaradas reciben `---` explícito. Combinado con `hide unreadable = yes` en Samba, estas carpetas no aparecen en el explorador de Windows.
+- El perfil BIM es la excepción: obtiene control total sobre el WIP (`wip_full_control`).
 
-> **"Lo que no edita, NO lo ve (ni lo lista, ni le aparece)"**
+**Proyectos con estructura no estándar** (sin `01_WIP` en el primer nivel):
+- El script navega el árbol nivel por nivel hasta que el usuario identifica la carpeta WIP equivalente.
+- Se solicitan los permisos por grupo para cada subcarpeta.
+- La configuración no se persiste: se aplica directamente tras confirmación.
 
-Modelo **DENY-BY-DEFAULT**:
-
-- Solo se otorgan permisos explícitos en carpetas declaradas como `write`.
-- En `01_WIP`, los perfiles restringidos reciben **solo `x` (traverse)**.
-- Las carpetas no editables reciben ACL explícita `---`.
-- BIM es la única excepción con visibilidad total del WIP.
----
-
-## Perfiles y permisos
-
-| Perfil | Carpetas con visualización y edición |
-|------|--------------------------------------|
-| IND_A | A_ARQ, O_LEV, YAC_ACU, YPA_PAT, YPM_PTR, YSE_SEN, YSH_SGH |
-| IND_E | E_EST, O_LEV |
-| IND_YTP | YTP_TOP, A_ARQ, O_LEV, YAC_ACU, YPA_PAT, YPM_PTR, YSE_SEN, YSH_SGH, E_EST |
-| IND_B | TODAS las carpetas del WIP |
-
-
-## Reglas operativas
-
-- Git **NUNCA** con `sudo`.
-- Scripts ACL **SIEMPRE** con `sudo`.
-- No modificar ACLs manualmente fuera del sistema.
-- Flujo obligatorio: **backup → DRY-RUN → apply**.
+Existe una validación dura que impide ejecutar los scripts fuera de `/srv/samba/02_Proyectos`.
 
 ---
 
 ## 3. Instrucciones de uso
 
-### Backup (obligatorio)
+El punto de entrada es `perfilar.sh`. Este script gestiona el flujo completo.
 
-Antes de cualquier ejecución se debe realizar un respaldo completo de ACLs:
-
+### Ejecutar la perfilación
 
 ```bash
-sudo ./scripts/backup_restore_acl.sh backup \
-  /srv/samba/02_Proyectos \
-  /root/acl_before_$(date +%Y%m%d_%H%M).facl
+sudo bash scripts/perfilar.sh
 ```
 
-### DRY-RUN (prueba)
-Permite validar el impacto sin modificar permisos reales:
-```bash
-sudo DRY_RUN=1 ./scripts/apply_acls.sh
-```
-Durante el DRY-RUN se muestran los comandos setfacl que serían ejecutados, pero no se aplican cambios.
+El script:
+1. Lista los proyectos disponibles indicando si son estándar o no estándar.
+2. El usuario selecciona el proyecto por número.
+3. Muestra el proyecto seleccionado, su tipo de estructura y el script que se ejecutará.
+4. Solicita confirmación antes de proceder.
+5. Genera un backup automático de las ACLs actuales.
+6. Ejecuta el script correspondiente según la estructura detectada.
 
+### Revertir cambios (rollback)
 
-### Ejecución real
-Una vez validado el DRY-RUN:
+Al finalizar, el script muestra el comando exacto para revertir si es necesario:
+
 ```bash
-sudo ./scripts/apply_acls.sh
+sudo bash scripts/backup_restore_acl.sh restore backups/acl_before_YYYYMMDD_HHMMSS.facl
 ```
 
 ---
 
-## Rollback
-
-```bash
-sudo ./scripts/backup_restore_acl.sh restore / /root/acl_before_YYYYMMDD_HHMM.facl
-```
---------
-
-## 4. Diagrama de secuencia (Entrada y salida)
+## 4. Diagrama de secuencia (Entradas y salidas)
 
 ![Diagrama de secuencia del sistema de gestión de ACLs](docs/seq.png)
 
+---
 
---------------
 ## 5. Estructura del repositorio
 
 ```
 SCR-ACLs_SMB/
-├── backups
-│   ├── acl_before_20260203_182348.facl
-│   ├── acl_before_20260203_182510.facl
-│   ├── acl_before_20260203_190718.facl
-│   └── acl_before_20260203_192226.facl
-├── BITACORA.md
-├── config
-│   └── acls.ini
-├── docs
-│   └── seq.png
-├── legacy
-│   └── Asignar_permisos.sh
-├── logs
-│   ├── apply_acls.log
-│   └── backup_restore_acl.log
-├── README.md
-└── scripts
-    ├── apply_acls.sh
-    ├── backup_restore_acl.sh
-    └── validate.sh
+├── config/
+│   └── acls.ini                    ← Declaración de perfiles y permisos (fuente de verdad)
+├── scripts/
+│   ├── perfilar.sh                 ← Punto de entrada principal
+│   ├── apply_acls.sh               ← Permisos para proyectos con estructura estándar
+│   ├── apply_acls_nonstandard.sh   ← Asistente nivel por nivel para estructura no estándar
+│   └── backup_restore_acl.sh       ← Backup y rollback de ACLs
+├── legacy/
+│   └── Asignar_permisos.sh         ← Script anterior (reemplazado)
+├── docs/
+│   └── seq.png                     ← Diagrama de secuencia
+├── BITACORA.md                     ← Registro de decisiones de diseño
+└── README.md
 ```
