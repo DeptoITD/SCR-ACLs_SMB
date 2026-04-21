@@ -105,11 +105,42 @@ declare -a ACL_CMDS=()
 # Popula globales _WRITE_PROFILES y _DENY_PROFILES
 # -------------------------
 declare -a _WRITE_PROFILES=()
+declare -a _READ_PROFILES=()
 declare -a _DENY_PROFILES=()
+
+# Parsea una respuesta de selección de perfiles y popula un array asociativo
+# Uso: _parse_selection "$input" remaining_profiles_array result_assoc_array
+_parse_selection() {
+  local input="$1" arr_name="$2" result_name="$3"
+  local -n _arr="$arr_name"
+  local -n _result="$result_name"
+
+  if [[ "${input,,}" == "todos" ]]; then
+    for p in "${_arr[@]}"; do _result["$p"]=1; done
+    return
+  fi
+  [[ "${input,,}" == "ninguno" || -z "$input" ]] && return
+
+  IFS=',' read -r -a parts <<< "$input"
+  for part in "${parts[@]}"; do
+    part="$(trim "$part")"
+    if [[ "$part" =~ ^[0-9]+$ ]]; then
+      local idx=$((part - 1))
+      if [[ $idx -ge 0 && $idx -lt ${#_arr[@]} ]]; then
+        _result["${_arr[$idx]}"]=1
+      else
+        printf "  [!] Número fuera de rango ignorado: %s\n" "$part"
+      fi
+    else
+      printf "  [!] Entrada no válida ignorada: '%s'\n" "$part"
+    fi
+  done
+}
 
 select_profiles() {
   local rel="$1"
   _WRITE_PROFILES=()
+  _READ_PROFILES=()
   _DENY_PROFILES=()
 
   printf "\n"
@@ -120,42 +151,46 @@ select_profiles() {
   for i in "${!PROFILES[@]}"; do
     printf "    %3d) %s\n" $((i+1)) "${PROFILES[$i]}"
   done
-  printf "\n  ¿Quién puede EDITAR aquí? (abrir carpetas, crear y modificar documentos)\n"
+
+  # --- Pregunta 1: ¿Quién EDITA aquí? ---
+  printf "\n  ¿Quién puede EDITAR aquí? (crear y modificar documentos)\n"
   printf "  Ingresa números separados por coma, 'todos' o 'ninguno': "
+  local input1
+  read -r input1 < /dev/tty
+  input1="$(trim "$input1")"
 
-  local input
-  read -r input < /dev/tty
-  input="$(trim "$input")"
-
-  if [[ "${input,,}" == "todos" ]]; then
-    _WRITE_PROFILES=("${PROFILES[@]}")
-    return
-  fi
-
-  if [[ "${input,,}" == "ninguno" || -z "$input" ]]; then
-    _DENY_PROFILES=("${PROFILES[@]}")
-    return
-  fi
-
-  local -A sel=()
-  IFS=',' read -r -a parts <<< "$input"
-  for part in "${parts[@]}"; do
-    part="$(trim "$part")"
-    if [[ "$part" =~ ^[0-9]+$ ]]; then
-      local idx=$((part - 1))
-      if [[ $idx -ge 0 && $idx -lt ${#PROFILES[@]} ]]; then
-        sel["${PROFILES[$idx]}"]=1
-      else
-        printf "  [!] Número fuera de rango ignorado: %s\n" "$part"
-      fi
+  local -A write_sel=()
+  _parse_selection "$input1" PROFILES write_sel
+  local -a remaining=()
+  for p in "${PROFILES[@]}"; do
+    if [[ "${write_sel[$p]+x}" ]]; then
+      _WRITE_PROFILES+=("$p")
     else
-      printf "  [!] Entrada no válida ignorada: '%s'\n" "$part"
+      remaining+=("$p")
     fi
   done
 
-  for p in "${PROFILES[@]}"; do
-    if [[ "${sel[$p]+x}" ]]; then
-      _WRITE_PROFILES+=("$p")
+  # Si todos editan o no queda nadie sin asignar, terminar
+  if [[ "${#remaining[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  # --- Pregunta 2: de los restantes, ¿quién puede al menos VER/ENTRAR? ---
+  printf "\n  De los restantes, ¿quién puede VER/ENTRAR (navegar, bajar más profundo)?\n"
+  printf "  Perfiles aún sin asignar:\n"
+  for i in "${!remaining[@]}"; do
+    printf "    %3d) %s\n" $((i+1)) "${remaining[$i]}"
+  done
+  printf "  Ingresa números separados por coma, 'todos' o 'ninguno': "
+  local input2
+  read -r input2 < /dev/tty
+  input2="$(trim "$input2")"
+
+  local -A read_sel=()
+  _parse_selection "$input2" remaining read_sel
+  for p in "${remaining[@]}"; do
+    if [[ "${read_sel[$p]+x}" ]]; then
+      _READ_PROFILES+=("$p")
     else
       _DENY_PROFILES+=("$p")
     fi
@@ -174,15 +209,13 @@ walk_tree() {
   select_profiles "$rel"
 
   local -a wp=("${_WRITE_PROFILES[@]:-}")
+  local -a rp=("${_READ_PROFILES[@]:-}")
   local -a dp=("${_DENY_PROFILES[@]:-}")
 
   # Mostrar resumen de la selección
-  if [[ ${#wp[@]} -gt 0 ]]; then
-    printf "  → Edición: %s\n" "${wp[*]}"
-  fi
-  if [[ ${#dp[@]} -gt 0 ]]; then
-    printf "  → Sin acceso (oculto): %s\n" "${dp[*]}"
-  fi
+  [[ ${#wp[@]} -gt 0 ]] && printf "  → Edición   (rwx): %s\n" "${wp[*]}"
+  [[ ${#rp[@]} -gt 0 ]] && printf "  → Ver/entrar(r-x): %s\n" "${rp[*]}"
+  [[ ${#dp[@]} -gt 0 ]] && printf "  → Oculto    (---): %s\n" "${dp[*]}"
 
   # Si hay subcarpetas, ofrecer atajo recursivo
   local apply_rec=0
@@ -203,6 +236,9 @@ walk_tree() {
     for p in "${wp[@]:-}"; do
       ACL_CMDS+=("WRITE_REC|$(resolve_acl_subject "$p")|${dir}")
     done
+    for p in "${rp[@]:-}"; do
+      ACL_CMDS+=("READ_REC|$(resolve_acl_subject "$p")|${dir}")
+    done
     for p in "${dp[@]:-}"; do
       ACL_CMDS+=("DENY_REC|$(resolve_acl_subject "$p")|${dir}")
     done
@@ -210,6 +246,9 @@ walk_tree() {
     # No recursivo: solo dir actual + archivos directos; luego DFS en subdirs
     for p in "${wp[@]:-}"; do
       ACL_CMDS+=("WRITE_DIR|$(resolve_acl_subject "$p")|${dir}")
+    done
+    for p in "${rp[@]:-}"; do
+      ACL_CMDS+=("READ_DIR|$(resolve_acl_subject "$p")|${dir}")
     done
     for p in "${dp[@]:-}"; do
       ACL_CMDS+=("DENY_DIR|$(resolve_acl_subject "$p")|${dir}")
@@ -247,6 +286,19 @@ apply_acl_cmds() {
           find -P "$path" -maxdepth 1 -type f -exec setfacl -m "${kind}:${name}:rw-" {} + 2>/dev/null || true
         fi
         ;;
+      READ_DIR)
+        printf "  # %s → r-x (dir, navegar; archivos directos r--)\n" "$path" | tee -a "${LOG_FILE}"
+        if [[ "${DRY_RUN}" == "1" ]]; then
+          printf "  🧾 setfacl -m %s:%s:r-x '%s'\n"   "$kind" "$name" "$path" | tee -a "${LOG_FILE}"
+          printf "  🧾 setfacl -d -m %s:%s:r-x '%s'\n" "$kind" "$name" "$path" | tee -a "${LOG_FILE}"
+          printf "  🧾 find '%s' -maxdepth 1 -type f -exec setfacl -m %s:%s:r-- {} +\n" \
+            "$path" "$kind" "$name" | tee -a "${LOG_FILE}"
+        else
+          setfacl -m "${kind}:${name}:r-x" "$path"
+          setfacl -d -m "${kind}:${name}:r-x" "$path"
+          find -P "$path" -maxdepth 1 -type f -exec setfacl -m "${kind}:${name}:r--" {} + 2>/dev/null || true
+        fi
+        ;;
       DENY_DIR)
         printf "  # %s → --- (dir + archivos directos)\n" "$path" | tee -a "${LOG_FILE}"
         if [[ "${DRY_RUN}" == "1" ]]; then
@@ -258,6 +310,18 @@ apply_acl_cmds() {
           setfacl -m "${kind}:${name}:---" "$path"
           setfacl -d -m "${kind}:${name}:---" "$path"
           find -P "$path" -maxdepth 1 -type f -exec setfacl -m "${kind}:${name}:---" {} + 2>/dev/null || true
+        fi
+        ;;
+      READ_REC)
+        printf "  # %s → r-x recursivo (dirs) + r-- (archivos)\n" "$path" | tee -a "${LOG_FILE}"
+        if [[ "${DRY_RUN}" == "1" ]]; then
+          printf "  🧾 find '%s' -xdev -type d -exec setfacl -m %s:%s:r-x {} +\n"   "$path" "$kind" "$name" | tee -a "${LOG_FILE}"
+          printf "  🧾 find '%s' -xdev -type d -exec setfacl -d -m %s:%s:r-x {} +\n" "$path" "$kind" "$name" | tee -a "${LOG_FILE}"
+          printf "  🧾 find '%s' -xdev -type f -exec setfacl -m %s:%s:r-- {} +\n"   "$path" "$kind" "$name" | tee -a "${LOG_FILE}"
+        else
+          find -P "$path" -xdev -type d -exec setfacl -m "${kind}:${name}:r-x" {} +
+          find -P "$path" -xdev -type d -exec setfacl -d -m "${kind}:${name}:r-x" {} +
+          find -P "$path" -xdev -type f -exec setfacl -m "${kind}:${name}:r--" {} +
         fi
         ;;
       WRITE_REC)
